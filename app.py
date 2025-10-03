@@ -27,11 +27,33 @@ def cleanResume(txt):
 # -----------------------------
 @st.cache_resource
 def load_model():
-    model = pickle.load(open("clf.pkl", "rb"))       # trained classifier
+    model = pickle.load(open("clf.pkl", "rb"))      # trained classifier
     vectorizer = pickle.load(open("tfidf.pkl", "rb"))  # fitted TF-IDF
     return model, vectorizer
 
-clf, tfidf = load_model()
+# Check if the model files exist before trying to load them
+try:
+    clf, tfidf = load_model()
+except FileNotFoundError:
+    st.error("Error: Could not find 'clf.pkl' or 'tfidf.pkl'. Please ensure your trained model and vectorizer files are in the root directory.")
+    # Use a placeholder model/vectorizer to allow the app to run partially for demonstration
+    class PlaceholderClassifier:
+        def predict(self, X):
+            # Returns a default category ID (e.g., Data Science)
+            return np.array([6]) 
+        def predict_proba(self, X):
+            # Returns equal probability for all categories for demo
+            num_categories = 25 
+            return np.array([[1/num_categories] * num_categories])
+            
+    class PlaceholderVectorizer:
+        def transform(self, raw_documents):
+            # Returns a dummy feature vector
+            return np.zeros((len(raw_documents), 1000))
+            
+    clf = PlaceholderClassifier()
+    tfidf = PlaceholderVectorizer()
+
 
 # -----------------------------
 # Category Mapping
@@ -48,16 +70,35 @@ category_mapping = {
 }
 
 # -----------------------------
-# Extract Text from Upload
+# Extract Text from Upload - IMPROVED DOCX AND SEEK HANDLING
 # -----------------------------
 def extract_text(uploaded_file):
+    # Always reset the pointer to the beginning of the file-like object
+    uploaded_file.seek(0) 
+
     if uploaded_file.type == "application/pdf":
-        pdf_reader = PyPDF2.PdfReader(uploaded_file)
-        return " ".join([page.extract_text() for page in pdf_reader.pages if page.extract_text()])
+        try:
+            pdf_reader = PyPDF2.PdfReader(uploaded_file)
+            return " ".join([page.extract_text() for page in pdf_reader.pages if page.extract_text()])
+        except Exception as e:
+            st.error(f"Error reading PDF: {e}")
+            return ""
+            
     elif uploaded_file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-        return docx2txt.process(uploaded_file)
+        try:
+            # FIX: Read the binary content of the file-like object
+            binary_content = uploaded_file.read()
+            # docx2txt.process can accept the binary content directly
+            text = docx2txt.process(binary_content)
+            # docx2txt returns a bytes-like object if passed binary, ensure it's a string
+            return text.decode("utf-8") if isinstance(text, bytes) else text
+        except Exception as e:
+            st.error(f"Error reading DOCX: {e}")
+            return ""
+            
     elif uploaded_file.type == "text/plain":
         return uploaded_file.read().decode("utf-8")
+        
     else:
         return ""
 
@@ -102,25 +143,34 @@ elif menu == "📄 Single Resume":
         with st.spinner("Analyzing resume..."):
             raw_text = extract_text(uploaded_file)
             
-            # Show Resume Content
-            st.subheader("📄 Resume Content")
-            st.text_area("Resume Text", raw_text, height=300)
-            
-            cleaned_text = cleanResume(raw_text)
-            input_features = tfidf.transform([cleaned_text])
-            prediction_id = clf.predict(input_features)[0]
-            category_name = category_mapping.get(prediction_id, "Unknown")
+            if not raw_text:
+                st.warning("Could not extract any text from the uploaded file.")
+            else:
+                # Show Resume Content
+                st.subheader("📄 Resume Content")
+                st.text_area("Resume Text", raw_text, height=300)
+                
+                cleaned_text = cleanResume(raw_text)
+                
+                # Check for empty text after cleaning
+                if not cleaned_text:
+                    st.warning("Resume content was successfully extracted but appears to be empty after cleaning.")
+                else:
+                    input_features = tfidf.transform([cleaned_text])
+                    prediction_id = clf.predict(input_features)[0]
+                    category_name = category_mapping.get(prediction_id, "Unknown")
 
-            st.success(f"🎯 Predicted Job Category: **{category_name}**")
+                    st.success(f"🎯 Predicted Job Category: **{category_name}**")
 
-            # Show Probabilities
-            probs = clf.predict_proba(input_features)[0]
-            prob_df = pd.DataFrame({
-                "Category": [category_mapping.get(i, str(i)) for i in range(len(probs))],
-                "Confidence (%)": (probs * 100).round(2)
-            }).sort_values(by="Confidence (%)", ascending=False)
-            st.subheader("📊 Prediction Confidence")
-            st.bar_chart(prob_df.set_index("Category"))
+                    # Show Probabilities
+                    probs = clf.predict_proba(input_features)[0]
+                    prob_df = pd.DataFrame({
+                        "Category": [category_mapping.get(i, str(i)) for i in range(len(probs))],
+                        "Confidence (%)": (probs * 100).round(2)
+                    }).sort_values(by="Confidence (%)", ascending=False)
+                    st.subheader("📊 Prediction Confidence")
+                    # Limit to top 10 categories for cleaner chart
+                    st.bar_chart(prob_df.head(10).set_index("Category"))
 
 # -----------------------------
 # MULTIPLE RESUMES
@@ -131,22 +181,28 @@ elif menu == "📂 Multiple Resumes":
 
     if uploaded_files:
         results = []
-        for f in uploaded_files:
-            raw_text = extract_text(f)
-            cleaned_text = cleanResume(raw_text)
-            input_features = tfidf.transform([cleaned_text])
-            prediction_id = clf.predict(input_features)[0]
-            category_name = category_mapping.get(prediction_id, "Unknown")
-            
-            # Get confidence for the predicted class
-            probs = clf.predict_proba(input_features)[0]
-            top_confidence = (probs[prediction_id] * 100).round(2)
-            
-            results.append({
-                "File": f.name,
-                "Predicted Category": category_name,
-                "Confidence (%)": top_confidence
-            })
+        with st.spinner(f"Analyzing {len(uploaded_files)} resumes..."):
+            for f in uploaded_files:
+                raw_text = extract_text(f)
+                cleaned_text = cleanResume(raw_text)
+                
+                category_name = "N/A (No Text)"
+                top_confidence = 0.0
+                
+                if cleaned_text:
+                    input_features = tfidf.transform([cleaned_text])
+                    prediction_id = clf.predict(input_features)[0]
+                    category_name = category_mapping.get(prediction_id, "Unknown")
+                    
+                    # Get confidence for the predicted class
+                    probs = clf.predict_proba(input_features)[0]
+                    top_confidence = (probs[prediction_id] * 100).round(2)
+                
+                results.append({
+                    "File": f.name,
+                    "Predicted Category": category_name,
+                    "Confidence (%)": top_confidence
+                })
 
         df_results = pd.DataFrame(results)
         st.dataframe(df_results)
@@ -167,12 +223,21 @@ elif menu == "📑 Job Match":
     uploaded_file = st.file_uploader("Upload Resume", type=["pdf", "docx", "txt"], key="job_match")
     job_desc = st.text_area("Paste Job Description Here")
 
-    if uploaded_file and job_desc:
-        resume_text = cleanResume(extract_text(uploaded_file))
-        job_text = cleanResume(job_desc)
-        vectors = tfidf.transform([resume_text, job_text])
-        similarity = cosine_similarity(vectors[0], vectors[1])[0][0] * 100
-        st.info(f"✅ Resume matches **{similarity:.2f}%** with the job description.")
+    if st.button("Calculate Match Score") and uploaded_file and job_desc:
+        with st.spinner("Calculating similarity..."):
+            resume_text = cleanResume(extract_text(uploaded_file))
+            job_text = cleanResume(job_desc)
+            
+            if not resume_text or not job_text:
+                st.error("Please ensure text is extracted from the resume and the job description is not empty.")
+            else:
+                # To calculate cosine similarity, both vectors must be transformed.
+                # However, your vectorizer (tfidf) was trained on individual resumes,
+                # so transforming two separate documents into one sparse matrix, then 
+                # calculating similarity between the two rows is the correct approach.
+                vectors = tfidf.transform([resume_text, job_text])
+                similarity = cosine_similarity(vectors[0], vectors[1])[0][0] * 100
+                st.info(f"✅ Resume matches **{similarity:.2f}%** with the job description.")
 
 # -----------------------------
 # ANALYTICS
@@ -185,10 +250,19 @@ elif menu == "📊 Analytics":
 
     if uploaded_files:
         categories = []
-        for f in uploaded_files:
-            text = cleanResume(extract_text(f))
-            pred = clf.predict(tfidf.transform([text]))[0]
-            categories.append(category_mapping.get(pred, "Unknown"))
+        with st.spinner(f"Processing {len(uploaded_files)} resumes for analytics..."):
+            for f in uploaded_files:
+                text = cleanResume(extract_text(f))
+                if text: # Only process if text was extracted
+                    pred = clf.predict(tfidf.transform([text]))[0]
+                    categories.append(category_mapping.get(pred, "Unknown"))
 
-        df = pd.DataFrame(categories, columns=["Category"])
-        st.bar_chart(df["Category"].value_counts())
+            if categories:
+                df = pd.DataFrame(categories, columns=["Category"])
+                # Use st.dataframe for the table and st.bar_chart for the visualization
+                st.subheader("Category Distribution")
+                st.bar_chart(df["Category"].value_counts())
+                st.subheader("Raw Counts")
+                st.dataframe(df["Category"].value_counts().reset_index().rename(columns={'index': 'Category', 'Category': 'Count'}))
+            else:
+                st.warning("No text could be extracted from the uploaded files to generate analytics.")
